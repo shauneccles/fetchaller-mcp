@@ -57,6 +57,50 @@ class TestComputeSign:
         assert len(result) == 32
 
 
+class TestExtractPunishUrl:
+    """Extraction of the x5sec TMD punish URL from a blocked MTop body."""
+
+    def test_extracts_and_normalizes(self):
+        """Pulls data.url and normalizes the ':443//' port + double slash."""
+        body = {
+            "ret": ["FAIL_SYS_USER_VALIDATE", "RGV587_ERROR::SM::x"],
+            "data": {
+                "url": "https://acs.aliexpress.com:443//h5/mtop.aliexpress.pdp.pc.query/1.0/_____tmd_____/punish?x5secdata=ABC&x5step=2"
+            },
+        }
+        assert MTopClient._extract_punish_url(body) == (
+            "https://acs.aliexpress.com/h5/mtop.aliexpress.pdp.pc.query/1.0/_____tmd_____/punish?x5secdata=ABC&x5step=2"
+        )
+
+    def test_success_body_returns_empty(self):
+        """A non-blocked body has no punish URL."""
+        assert MTopClient._extract_punish_url({"ret": ["SUCCESS"], "data": {}}) == ""
+
+    def test_non_tmd_url_returns_empty(self):
+        """A data.url that isn't a TMD punish page is ignored."""
+        assert MTopClient._extract_punish_url({"data": {"url": "https://x/y"}}) == ""
+
+    def test_missing_or_malformed_returns_empty(self):
+        """Empty / None / missing data shapes are handled safely."""
+        assert MTopClient._extract_punish_url({}) == ""
+        assert MTopClient._extract_punish_url({"data": None}) == ""
+
+
+class TestPunishChallengeType:
+    """Mapping a punish URL to the explicit wafer challenge type."""
+
+    def test_recaptcha_variant(self):
+        url = ".../_____tmd_____/punish?x5secdata=A&x5step=2&action=captchaRecaptcha&pureCaptcha="
+        assert MTopClient._punish_challenge_type(url) == "recaptcha"
+
+    def test_purecaptcha_variant(self):
+        assert MTopClient._punish_challenge_type(".../punish?pureCaptcha=1") == "recaptcha"
+
+    def test_slider_defaults_to_tmd(self):
+        url = ".../_____tmd_____/punish?x5secdata=A&x5step=1"
+        assert MTopClient._punish_challenge_type(url) == "tmd"
+
+
 class TestMTopClient:
     """MTop client token bootstrap and request flow."""
 

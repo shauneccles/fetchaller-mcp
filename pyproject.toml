@@ -48,3 +48,11 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
 ignore = ["E501"]  # Line length handled by formatter
+
+[tool.uv.sources]
+# Fork of wafer carrying fixes for AliExpress MTop x5sec solving, pending
+# upstream merge:
+#   - Averyy/wafer#1: Baxia drag headful viewport crash (None viewport_size)
+#   - Averyy/wafer#2: reCAPTCHA-escalated TMD punish page classification
+# Track the fork's `fixes` branch; uv.lock pins the exact commit.
+wafer-py = { git = "https://github.com/shauneccles/wafer.git", branch = "fixes" }

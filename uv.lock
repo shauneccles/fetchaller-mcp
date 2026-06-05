@@ -428,7 +428,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=7.1.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15.12" },
     { name = "uvicorn", specifier = ">=0.46.0" },
-    { name = "wafer-py", extras = ["browser"], specifier = ">=0.2.1" },
+    { name = "wafer-py", extras = ["browser"], git = "https://github.com/shauneccles/wafer.git?branch=fixes" },
 ]
 provides-extras = ["dev"]
 
@@ -1629,14 +1629,10 @@ wheels = [
 
 [[package]]
 name = "wafer-py"
-version = "0.2.1"
-source = { registry = "https://pypi.org/simple" }
+version = "0.2.2.dev2+gc1ca7a81d"
+source = { git = "https://github.com/shauneccles/wafer.git?branch=fixes#c1ca7a81d6d9aa6367d8d0f744a464a494085bab" }
 dependencies = [
     { name = "wreq" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/3a/2e/b2d20647622b54f293d32e2da08ece374fca0cfa0e3bc1f42131bcaff038/wafer_py-0.2.1.tar.gz", hash = "sha256:caab12f4fa35c7323615b85d487c874265c1c54fefa6b00971d82b1ba968d2f8", size = 1034663, upload-time = "2026-05-11T14:23:19.689Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/04/e9/b5fb64148a98c7faf075107d5c8f34cacf5d3be6a045ec5435af8cfb3b37/wafer_py-0.2.1-py3-none-any.whl", hash = "sha256:69eb0c9536b87f9d3e9de1d2eb23e0d1d1537056f346bfa6bb48104bbb4d0e2e", size = 348546, upload-time = "2026-05-11T14:23:17.868Z" },
 ]
 
 [package.optional-dependencies]

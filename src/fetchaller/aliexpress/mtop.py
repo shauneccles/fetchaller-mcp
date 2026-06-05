@@ -15,11 +15,14 @@ wafer's automatic challenge detection is designed for HTML challenge pages
 would cause wafer to detect the ``x5secdata`` cookie, try to browser-solve
 the API URL, get a JSON page in the browser (not a challenge), and time out.
 
-The correct approach is for fetchaller to handle this as application-level
-auth: when the API says "your tokens are bad", we visit aliexpress.com in a
-browser (where page JS makes internal MTop calls that set ``_m_h5_tk``),
-extract those cookies, and inject them into the API session. This is domain
-logic that belongs in the caller, not in wafer's transport layer.
+The correct approach is for fetchaller to handle this at the application layer.
+A blocked response (``FAIL_SYS_USER_VALIDATE`` / ``RGV587_ERROR``) is an x5sec
+TMD challenge: the JSON body carries the challenge page URL in ``data.url``
+(``.../_____tmd_____/punish?x5secdata=...``). We extract that URL and hand it
+to the browser solver, which clears the challenge; we then inject the resulting
+cookies and re-bootstrap ``_m_h5_tk``. Visiting aliexpress.com directly (where
+page JS makes internal MTop calls that set ``_m_h5_tk``) is kept as a fallback.
+This is domain logic that belongs in the caller, not in wafer's transport layer.
 """
 
 from __future__ import annotations
@@ -138,58 +141,160 @@ class MTopClient:
         _log("browser solve succeeded but no _m_h5_tk in cookies")
         return False
 
+    @staticmethod
+    def _extract_punish_url(body: dict) -> str:
+        """Extract the x5sec punish/challenge URL from a blocked MTop body.
+
+        On an x5sec block the API returns HTTP 200 with a JSON body like::
+
+            {"ret": ["FAIL_SYS_USER_VALIDATE", "RGV587_ERROR..."],
+             "data": {"url": "https://acs.aliexpress.com:443//h5/.../_____tmd_____/punish?x5secdata=..."}}
+
+        That ``url`` is the actual TMD challenge page. Returns it with the
+        ``:443`` port and doubled slashes normalized, or "" if absent.
+        """
+        data = body.get("data") if isinstance(body, dict) else None
+        url = data.get("url", "") if isinstance(data, dict) else ""
+        if not url or "_____tmd_____" not in url:
+            return ""
+        url = url.replace(":443/", "/")
+        return re.sub(r"(https?://[^/]+)//+", r"\1/", url)
+
+    @staticmethod
+    def _punish_challenge_type(punish_url: str) -> str:
+        """Pick the wafer challenge type for an x5sec punish URL.
+
+        The punish page presents a Baxia slider by default but escalates to
+        reCAPTCHA (``action=captchaRecaptcha`` / ``pureCaptcha``) under load.
+        wafer's ``solve()`` does not auto-detect the type from the page, so we
+        pass it explicitly: ``"recaptcha"`` for the reCAPTCHA variant, else
+        ``"tmd"`` (the Baxia slider).
+        """
+        low = punish_url.lower()
+        if "recaptcha" in low or "purecaptcha" in low:
+            return "recaptcha"
+        return "tmd"
+
+    async def _browser_solve_punish(self, punish_url: str) -> bool:
+        """Solve the x5sec TMD challenge at the punish URL the API handed back.
+
+        Unlike :meth:`_browser_solve_for_token` (which visits the homepage to
+        obtain ``_m_h5_tk``), this navigates the browser to the *actual*
+        challenge page referenced in the blocked response, letting wafer's
+        challenge solver clear x5sec. Resulting cookies are injected into the
+        session; the caller should re-bootstrap the token afterwards.
+
+        Returns True if the solve produced cookies.
+        """
+        if not self._browser_solver or not punish_url:
+            return False
+
+        challenge_type = self._punish_challenge_type(punish_url)
+        _log(f"solving x5sec punish challenge ({challenge_type}): {punish_url[:90]}...")
+        try:
+            result = await asyncio.to_thread(
+                self._browser_solver.solve,
+                punish_url,
+                challenge_type,
+            )
+        except Exception as e:
+            _log(f"punish solve failed: {e}")
+            return False
+
+        if not result:
+            _log("punish solve returned no result")
+            return False
+
+        cookies = result.cookies or []
+        session = await self._get_session()
+        for cookie in cookies:
+            name = cookie.get("name", "")
+            value = cookie.get("value", "")
+            domain = cookie.get("domain", "")
+            if name and value:
+                raw = f"{name}={value}; Domain={domain}; Path=/"
+                session.add_cookie(raw, "https://www.aliexpress.com/")
+                if name == "_m_h5_tk" and value:
+                    self._token = value.split("_")[0]
+                    self._token_time = time.time()
+        _log(f"punish solve injected {len(cookies)} cookies")
+        return bool(cookies)
+
+    async def _do_bootstrap_request(self) -> tuple[bool, dict]:
+        """Issue a ``token="undefined"`` bootstrap request.
+
+        Returns ``(token_found, parsed_body)``. ``_m_h5_tk`` is extracted from
+        Set-Cookie when present; otherwise ``parsed_body`` carries the x5sec
+        punish URL (see :meth:`_extract_punish_url`).
+        """
+        session = await self._get_session()
+        timestamp = str(int(time.time() * 1000))
+        sign = compute_sign("undefined", timestamp, self.APP_KEY, "{}")
+
+        # Use a real API endpoint — AliExpress only sets _m_h5_tk on actual API calls
+        url = f"{self.BASE_URL}/h5/mtop.aliexpress.pdp.pc.query/1.0/"
+        params = {
+            "jsv": "2.5.1",
+            "appKey": self.APP_KEY,
+            "t": timestamp,
+            "sign": sign,
+            "api": "mtop.aliexpress.pdp.pc.query",
+            "v": "1.0",
+            "timeout": "5000",
+            "type": "originaljson",
+            "dataType": "json",
+            "data": "{}",
+        }
+        headers = {"Referer": "https://www.aliexpress.com/"}
+        resp = await session.get(url, params=params, headers=headers, timeout=10)
+
+        for cookie_val in resp.get_all("set-cookie"):
+            if "_m_h5_tk=" in cookie_val and "_m_h5_tk_enc" not in cookie_val:
+                val = cookie_val.split("_m_h5_tk=")[1].split(";")[0]
+                self._token = val.split("_")[0]
+                self._token_time = time.time()
+                _log(f"token bootstrapped: {self._token[:8]}...")
+                return True, {}
+
+        # No token cookie — parse the body for the x5sec punish URL.
+        body: dict = {}
+        try:
+            text = resp.text
+            jsonp = re.match(r"^\s*\w+\(([\s\S]+)\)\s*;?\s*$", text)
+            if jsonp:
+                text = jsonp.group(1)
+            body = json.loads(text)
+        except Exception:
+            pass
+        return False, body
+
     async def _bootstrap_token(self) -> None:
         """Bootstrap a token by making a request with token="undefined".
 
-        The server returns FAIL_SYS_TOKEN_EMPTY and sets _m_h5_tk cookie.
-        We use a real API endpoint (not a dedicated bootstrap URL) because
-        AliExpress only sets the token cookie on actual API requests.
-
-        If the API blocks with x5sec, falls back to browser_solver.
+        AliExpress only sets the _m_h5_tk cookie on actual API requests, so we
+        hit a real endpoint. If x5sec blocks the bootstrap (RGV587), the JSON
+        body references a TMD punish URL: we solve that challenge in the
+        browser, then retry the bootstrap. A homepage solve is the last resort.
         """
         async with self._bootstrap_lock:
             # Double-check after acquiring lock (another coroutine may have bootstrapped)
             if not self._token_expired():
                 return
 
-            session = await self._get_session()
-            timestamp = str(int(time.time() * 1000))
-            data_str = "{}"
-            sign = compute_sign("undefined", timestamp, self.APP_KEY, data_str)
+            token_found, body = await self._do_bootstrap_request()
+            if token_found:
+                return
 
-            # Use a real API endpoint — AliExpress only sets _m_h5_tk on actual API calls
-            url = f"{self.BASE_URL}/h5/mtop.aliexpress.pdp.pc.query/1.0/"
-            params = {
-                "jsv": "2.5.1",
-                "appKey": self.APP_KEY,
-                "t": timestamp,
-                "sign": sign,
-                "api": "mtop.aliexpress.pdp.pc.query",
-                "v": "1.0",
-                "timeout": "5000",
-                "type": "originaljson",
-                "dataType": "json",
-                "data": data_str,
-            }
+            # x5sec-blocked bootstrap: solve the referenced TMD challenge, retry.
+            punish_url = self._extract_punish_url(body)
+            if punish_url and await self._browser_solve_punish(punish_url):
+                token_found, _ = await self._do_bootstrap_request()
+                if token_found:
+                    return
 
-            headers = {"Referer": "https://www.aliexpress.com/"}
-            resp = await session.get(url, params=params, headers=headers, timeout=10)
-
-            # Extract _m_h5_tk from response Set-Cookie headers
-            token_found = False
-            for cookie_val in resp.get_all("set-cookie"):
-                if "_m_h5_tk=" in cookie_val and "_m_h5_tk_enc" not in cookie_val:
-                    val = cookie_val.split("_m_h5_tk=")[1].split(";")[0]
-                    self._token = val.split("_")[0]
-                    self._token_time = time.time()
-                    _log(f"token bootstrapped: {self._token[:8]}...")
-                    token_found = True
-                    break
-
-            if not token_found:
-                _log("token bootstrap failed: no _m_h5_tk cookie received")
-                # Fall back to browser solve — page JS sets _m_h5_tk
-                await self._browser_solve_for_token()
+            _log("token bootstrap failed: no _m_h5_tk cookie received")
+            # Last resort: homepage visit — page JS sets _m_h5_tk
+            await self._browser_solve_for_token()
 
     async def request(
         self,
@@ -223,14 +328,23 @@ class MTopClient:
             await self._bootstrap_token()
             result = await self._do_request(api_name, version, data_dict)
 
-        # x5sec block — API-level auth rejection, not a WAF challenge.
-        # The API returns 200 JSON with these error codes when our session
-        # lacks valid tokens. Browser solve gets them (see module docstring).
+        # x5sec block — the API returns 200 JSON with these error codes plus a
+        # TMD punish URL in ``data.url``. Solve that challenge page, refresh the
+        # token if it got cleared, then retry. Homepage solve is the fallback.
         ret = result.get("ret", [])
         ret_str = " ".join(ret) if isinstance(ret, list) else str(ret)
         if "FAIL_SYS_USER_VALIDATE" in ret_str or "RGV587_ERROR" in ret_str:
-            _log("x5sec blocked MTop request, attempting browser solve")
-            if await self._browser_solve_for_token():
+            _log("x5sec blocked MTop request, solving challenge")
+            punish_url = self._extract_punish_url(result)
+            solved = False
+            if punish_url:
+                solved = await self._browser_solve_punish(punish_url)
+            if not solved:
+                # Fallback: homepage visit refreshes _m_h5_tk via page JS
+                solved = await self._browser_solve_for_token()
+            if solved:
+                if self._token_expired():
+                    await self._bootstrap_token()
                 result = await self._do_request(api_name, version, data_dict)
 
         return result
